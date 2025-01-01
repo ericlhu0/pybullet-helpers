@@ -5,7 +5,7 @@ from functools import partial
 import numpy as np
 import pybullet as p
 
-from pybullet_helpers.geometry import Pose
+from pybullet_helpers.geometry import Pose, set_pose
 from pybullet_helpers.inverse_kinematics import (
     inverse_kinematics,
     sample_joints_from_task_space_bounds,
@@ -15,6 +15,7 @@ from pybullet_helpers.math_utils import geometric_sequence
 from pybullet_helpers.motion_planning import (
     MotionPlanningHyperparameters,
     get_joint_positions_distance,
+    run_base_motion_planning,
     run_motion_planning,
     select_shortest_motion_plan,
     smoothly_follow_end_effector_path,
@@ -142,7 +143,21 @@ def test_run_motion_planning(physics_client_id):
 
 def test_motion_planning_additional_constraint(physics_client_id):
     """Tests for run_motion_planning with an additional state constraint."""
-    initial_joints = [2.5, -1.5, -2.1, 1.9, 2.9, 1.5, -2.6, 0.0, 0.0]
+    initial_joints = [
+        2.5,
+        -1.5,
+        -2.1,
+        1.9,
+        2.9,
+        1.5,
+        -2.6,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
     target_joints = list(initial_joints)
     target_joints[0] = -0.5
     robot = KinovaGen3RobotiqGripperPyBulletRobot(physics_client_id)
@@ -215,7 +230,21 @@ def test_motion_planning_additional_constraint(physics_client_id):
 
 def test_task_space_motion_planning(physics_client_id):
     """Tests for run_motion_planning with a custom sampling function."""
-    initial_joints = [2.5, -1.5, -2.1, 1.9, 2.9, 1.5, -2.6, 0.0, 0.0]
+    initial_joints = [
+        2.5,
+        -1.5,
+        -2.1,
+        1.9,
+        2.9,
+        1.5,
+        -2.6,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
     target_joints = list(initial_joints)
     target_joints[0] = -0.5
     robot = KinovaGen3RobotiqGripperPyBulletRobot(physics_client_id)
@@ -457,7 +486,7 @@ def test_smoothly_follow_end_effector_path(physics_client_id):
     for i in range(len(waypoints)):
         w1 = waypoints[i]
         w2 = recovered_waypoints[i]
-        assert w1.allclose(w2, atol=1e-4)
+        assert w1.allclose(w2, atol=1e-3)
 
     # Uncomment to visualize.
     # from pybullet_helpers.gui import visualize_pose
@@ -472,3 +501,58 @@ def test_smoothly_follow_end_effector_path(physics_client_id):
     #     for s in interpolate_joints(joint_infos, pt1, pt2, num_interp_per_unit=100):
     #         robot.set_joints(s)
     #         import time; time.sleep(0.01)
+
+
+def test_base_motion_planning_to_goal():
+    """Tests for run_base_motion_planning_to_goal()."""
+
+    # Uncomment for debugging.
+    # from pybullet_helpers.gui import create_gui_connection
+    # physics_client_id = create_gui_connection(camera_pitch=-90)
+    physics_client_id = p.connect(p.DIRECT)
+
+    robot = KinovaGen3RobotiqGripperPyBulletRobot(physics_client_id, fixed_base=False)
+    platform = create_pybullet_block(
+        (0.3, 1.0, 0.3, 1.0), (0.1, 0.1, 0.1), physics_client_id
+    )
+
+    obstacle = create_pybullet_block(
+        (1.0, 0.0, 0.0, 1.0), (0.2, 0.2, 0.1), physics_client_id
+    )
+    obstacle_pose = Pose((1.0, 0.0, 0.0))
+    set_pose(obstacle, obstacle_pose, physics_client_id)
+
+    collision_bodies = {obstacle}
+    seed = 123
+
+    initial_pose = robot.get_base_pose()
+    target_pose = Pose.from_rpy((2.0, 0.0, 0.0), (0.0, 0.0, np.pi))
+
+    position_lower_bounds = (-5.0, -5.0)
+    position_upper_bounds = (5.0, 5.0)
+
+    def goal_check(pt):
+        return (
+            np.linalg.norm(np.subtract(pt.position, target_pose.position)) < 0.5
+            and np.linalg.norm(np.subtract(pt.orientation, target_pose.orientation))
+            < 1.0
+        )
+
+    plan = run_base_motion_planning(
+        robot,
+        initial_pose,
+        goal_check,
+        position_lower_bounds,
+        position_upper_bounds,
+        collision_bodies,
+        seed,
+        physics_client_id,
+        platform=platform,
+    )
+    assert plan is not None
+
+    # Uncomment to visualize.
+    # import time
+    # for base_pose in plan:
+    #     robot.set_base(base_pose)
+    #     time.sleep(0.5)

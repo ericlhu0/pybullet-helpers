@@ -37,6 +37,13 @@ class Pose(NamedTuple):
         """Create a Pose from translation and Euler roll-pitch-yaw angles."""
         return cls(translation, quaternion_from_euler(*rpy))
 
+    @classmethod
+    def from_matrix(cls, matrix: npt.NDArray) -> Pose:
+        """Create a Pose from a 4x4 homogeneous matrix."""
+        return Pose(
+            position=tuple(matrix[:3, 3]), orientation=quat_from_matrix(matrix[:3, :3])
+        )
+
     @property
     def rpy(self) -> RollPitchYaw:
         """Get the Euler roll-pitch-yaw representation."""
@@ -46,6 +53,13 @@ class Pose(NamedTuple):
     def identity(cls) -> Pose:
         """Unit pose."""
         return cls((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def to_matrix(self) -> npt.NDArray:
+        """Get the 4x4 homogenous matrix representation."""
+        matrix = np.eye(4)
+        matrix[:3, :3] = matrix_from_quat(self.orientation)
+        matrix[:3, 3] = self.position
+        return matrix
 
     def multiply(self, *poses: Pose) -> Pose:
         """Multiplies poses (i.e., rigid transforms) together."""
@@ -58,9 +72,9 @@ class Pose(NamedTuple):
 
     def allclose(self, other: Pose, atol: float = 1e-6) -> bool:
         """Return whether this pose is close enough to another pose."""
-        return np.allclose(self.position, other.position, atol=atol) and np.allclose(
-            self.orientation, other.orientation, atol=atol
-        )
+        return np.allclose(
+            self.position, other.position, atol=atol
+        ) and orientations_allclose(self.orientation, other.orientation, atol=atol)
 
 
 def multiply_poses(*poses: Pose) -> Pose:
@@ -72,6 +86,23 @@ def multiply_poses(*poses: Pose) -> Pose:
         )
         pose = Pose(pybullet_pose[0], pybullet_pose[1])
     return pose
+
+
+def orientations_allclose(
+    quat1: Quaternion, quat2: Quaternion, atol: float = 1e-6
+) -> bool:
+    """Check whether two quaternion orientations are close, accounting for
+    double coverage.
+
+    Note that this should not be used to check if two rotations are
+    equal, e.g., in the context of slerp.
+
+    For example, see
+    https://gamedev.stackexchange.com/questions/75072/.
+    """
+    return np.allclose(quat1, quat2, atol=atol) or np.allclose(
+        quat1, -1 * np.array(quat2), atol=atol
+    )
 
 
 def matrix_from_quat(quat: Quaternion) -> npt.NDArray[np.float64]:
@@ -86,6 +117,19 @@ def quat_from_matrix(matrix: npt.NDArray[np.float64]) -> Quaternion:
     return tuple(quaternion_from_matrix(M))
 
 
+def rotate_pose(
+    pose: Pose, roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0
+) -> Pose:
+    """Rotate a pose by the given rpy to make a new pose."""
+    current_orn = pose.orientation
+    rot_orn = quaternion_from_euler(roll, pitch, yaw)
+    current_mat = matrix_from_quat(current_orn)
+    rot_mat = matrix_from_quat(rot_orn)
+    new_mat = current_mat @ rot_mat
+    new_orn = quat_from_matrix(new_mat)
+    return Pose(pose.position, new_orn)
+
+
 def get_pose(body: int, physics_client_id: int) -> Pose:
     """Get the pose of a body."""
     pybullet_pose = p.getBasePositionAndOrientation(
@@ -94,7 +138,17 @@ def get_pose(body: int, physics_client_id: int) -> Pose:
     return Pose(pybullet_pose[0], pybullet_pose[1])
 
 
-def interpolate_quats(
+def set_pose(body: int, pose: Pose, physics_client_id: int) -> None:
+    """Set the pose of a body."""
+    p.resetBasePositionAndOrientation(
+        body,
+        pose.position,
+        pose.orientation,
+        physicsClientId=physics_client_id,
+    )
+
+
+def iter_between_quats(
     q1: Quaternion,
     q2: Quaternion,
     num_interp: int = 10,
@@ -108,7 +162,7 @@ def interpolate_quats(
         yield tuple(slerp(t).as_quat())
 
 
-def interpolate_pose3ds(
+def iter_between_pose3ds(
     p1: Pose3D,
     p2: Pose3D,
     num_interp: int = 10,
@@ -122,7 +176,7 @@ def interpolate_pose3ds(
         yield tuple(positions[t])
 
 
-def interpolate_poses(
+def iter_between_poses(
     p1: Pose,
     p2: Pose,
     num_interp: int = 10,
@@ -130,10 +184,10 @@ def interpolate_poses(
 ) -> Iterator[Pose]:
     """Interpolate between two poses in pose space."""
     # Determine the number of interpolation steps.
-    pose3d_gen = interpolate_pose3ds(
+    pose3d_gen = iter_between_pose3ds(
         p1.position, p2.position, num_interp=num_interp, include_start=include_start
     )
-    quat_gen = interpolate_quats(
+    quat_gen = iter_between_quats(
         p1.orientation,
         p2.orientation,
         num_interp=num_interp,
@@ -141,3 +195,47 @@ def interpolate_poses(
     )
     for position, orientation in zip(pose3d_gen, quat_gen, strict=True):
         yield Pose(position, orientation)
+
+
+def interpolate_quats(q1: Quaternion, q2: Quaternion, t: float) -> Quaternion:
+    """Interpolate between q1 and q2 given 0 <= t <= 1."""
+    assert 0 <= t <= 1
+    slerp = Slerp([0, 1], ScipyRotation.from_quat([q1, q2]))
+    return tuple(slerp(t).as_quat())
+
+
+def interpolate_pose3d(p1: Pose3D, p2: Pose3D, t: float) -> Pose3D:
+    """Interpolate between p1 and p2 given 0 <= t <= 1."""
+    dists_arr = np.subtract(p2, p1)
+    return tuple(np.add(p1, t * dists_arr))
+
+
+def interpolate_poses(
+    p1: Pose,
+    p2: Pose,
+    t: float,
+) -> Pose:
+    """Interpolate between p1 and p2 given 0 <= t <= 1."""
+    assert 0 <= t <= 1
+    position = interpolate_pose3d(p1.position, p2.position, t)
+    quat = interpolate_quats(p1.orientation, p2.orientation, t)
+    return Pose(position, quat)
+
+
+def get_half_extents_from_aabb(
+    body_id: int,
+    physics_client_id: int,
+    link_id: int | None = None,
+) -> tuple[float, float, float]:
+    """Get box half extents based on AABB."""
+    if link_id is None:
+        aabb_min, aabb_max = p.getAABB(body_id, physicsClientId=physics_client_id)
+    else:
+        aabb_min, aabb_max = p.getAABB(
+            body_id, linkIndex=link_id, physicsClientId=physics_client_id
+        )
+    return (
+        (aabb_max[0] - aabb_min[0]) / 2,
+        (aabb_max[1] - aabb_min[1]) / 2,
+        (aabb_max[2] - aabb_min[2]) / 2,
+    )
